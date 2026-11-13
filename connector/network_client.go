@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -486,33 +487,48 @@ func (nc *MyNetworkClient) buildMemberList(ctx context.Context, roomID id.RoomID
 		nc.log.Warn().Err(err).Str("room_id", string(roomID)).Msg("Failed to fetch joined Matrix members")
 		return &bridgev2.ChatMemberList{Members: []bridgev2.ChatMember{nc.ownChatMember()}}
 	}
-	members := make([]bridgev2.ChatMember, 0, len(memberResp.Joined))
+	total := len(memberResp.Joined)
+	// Large public rooms can have thousands of members. Eagerly puppeting every
+	// one of them - and especially downloading
+	// each member's avatar synchronously - overwhelms the portal event loop
+	// ("Portal event channel is still full"). Cap how many members we puppet up
+	// front (self is always included) and skip per-member avatar downloads
+	// unless explicitly enabled.
+	maxMembers := envInt("LOCAL_MATRIX_MAX_MEMBERS", 50)
+	fetchAvatars := envBool("LOCAL_MATRIX_MEMBER_AVATARS", false)
+	members := make([]bridgev2.ChatMember, 0, total)
+	included := 0
 	for userID, member := range memberResp.Joined {
+		isFromMe := userID == nc.mx.UserID
+		if !isFromMe && maxMembers > 0 && included >= maxMembers {
+			continue
+		}
 		displayName := member.DisplayName
 		if displayName == "" {
 			displayName = userID.String()
 		}
-		isFromMe := userID == nc.mx.UserID
+		userInfo := &bridgev2.UserInfo{Name: &displayName}
+		if fetchAvatars {
+			userInfo.Avatar = nc.avatarFromMXC(ctx, id.ContentURIString(member.AvatarURL))
+		}
 		chatMember := bridgev2.ChatMember{
 			EventSender: bridgev2.EventSender{
 				Sender:   networkid.UserID(userID),
 				IsFromMe: isFromMe,
 			},
 			Membership: event.MembershipJoin,
-			UserInfo: &bridgev2.UserInfo{
-				Name:   &displayName,
-				Avatar: nc.avatarFromMXC(ctx, id.ContentURIString(member.AvatarURL)),
-			},
+			UserInfo:   userInfo,
 		}
 		if isFromMe {
 			chatMember.SenderLogin = nc.login.ID
 		}
 		members = append(members, chatMember)
+		included++
 	}
 	return &bridgev2.ChatMemberList{
-		IsFull:                     true,
+		IsFull:                     maxMembers <= 0 || total <= len(members),
 		ExcludeChangesFromTimeline: true,
-		TotalMemberCount:           len(members),
+		TotalMemberCount:           total,
 		Members:                    members,
 	}
 }
@@ -622,6 +638,17 @@ func (nc *MyNetworkClient) markBadAvatar(uri id.ContentURIString, err error) {
 			Err(err).
 			Str("mxc", string(uri)).
 			Msg("Skipping Matrix avatar because the media could not be downloaded")
+	}
+}
+
+func envBool(name string, fallback bool) bool {
+	switch strings.ToLower(os.Getenv(name)) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return fallback
 	}
 }
 
