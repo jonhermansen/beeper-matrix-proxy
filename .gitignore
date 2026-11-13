@@ -14,6 +14,8 @@ sh-vcvm-matrix
 beeper-matrix-proxy
 beeper-source
 perf-results/
+result
+result-*
 matrix-archive-sync/target/
 matrix-archive/
 contact-avatar-overrides.yaml
